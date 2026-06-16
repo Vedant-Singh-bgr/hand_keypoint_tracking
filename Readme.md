@@ -18,4 +18,11 @@ keypoint_tracking/
 ├── output/              # Generated JSON kinematic files (Ignored by Git)
 ├── .gitignore
 └── requirements.txt
+```
+## Command
+```text
+modal run main.py --video-path data/testing_YOLO.mp4 --output-json output/results.json
+
+
+
 
