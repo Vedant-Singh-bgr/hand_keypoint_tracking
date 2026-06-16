@@ -1,0 +1,24 @@
+# Python Environments & Cache
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Modal Temporary Files
+.modal/
+
+# Model Weights (Crucial: Keeps GitHub from crashing)
+*.pt
+*.pth
+*.ckpt
+
+# Large Media & Output Files
+*.mp4
+*.avi
+*.mov
+*.json
+
+# Ignore local data/output folders entirely
+data/
+output/
