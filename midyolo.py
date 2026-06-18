@@ -8,162 +8,6 @@ import time
 import numpy as np
 import cv2
 
-def get_skin_mask(roi_bgr):
-    lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
-    l_channel, a_channel, b_channel = cv2.split(lab)
-    
-    # Create a CLAHE object (clipLimit 2.0 and 8x8 grid are industry standards)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    cl = clahe.apply(l_channel)
-    
-    # Merge back and convert to BGR
-    limg = cv2.merge((cl, a_channel, b_channel))
-    clahe_bgr = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
-    
-    # Convert the flattened image to YCrCb
-    ycrcb = cv2.cvtColor(clahe_bgr, cv2.COLOR_BGR2YCrCb)
-    
-    # Standard human skin YCrCb strict bounds.
-    lower_skin = np.array([0, 133, 77], dtype=np.uint8)
-    upper_skin = np.array([255, 173, 127], dtype=np.uint8)
-    
-    mask = cv2.inRange(ycrcb, lower_skin, upper_skin)
-    
-    # Morphological Cleanup
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    
-    return mask
-
-class KalmanOpticalTracker:
-    def __init__(self):
-        # State: [x, y, dx, dy] | Measurement: [x, y]
-        self.kf = cv2.KalmanFilter(4, 2)
-        self.kf.measurementMatrix = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], np.float32)
-        self.kf.transitionMatrix = np.array([[1, 0, 1, 0], 
-                                             [0, 1, 0, 1],
-                                             [0, 0, 1, 0], 
-                                             [0, 0, 0, 1]], np.float32)
-        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
-        
-        self.prev_gray = None
-        self.prev_pts = None
-        self.is_tracking = False
-        self.last_box_size = 0
-
-    def update_with_detector(self, center_x, center_y, box_size, frame_gray, frame_bgr, valid_x1, valid_y1, valid_x2, valid_y2):
-        """YOLO sees the hand amodally. Update physics and extract skin pixels for future tracking."""
-        measurement = np.array([[np.float32(center_x)], [np.float32(center_y)]])
-        self.kf.correct(measurement)
-        
-        self.last_box_size = box_size
-        self.prev_gray = frame_gray.copy()
-        
-        # Create a mask only inside the bounding box, and ONLY on skin pixels
-        full_mask = np.zeros_like(frame_gray)
-        roi_bgr = frame_bgr[valid_y1:valid_y2, valid_x1:valid_x2]
-        
-        # Protect against empty slices at the absolute borders of the frame
-        if roi_bgr.size > 0:
-            skin_mask_roi = get_skin_mask(roi_bgr)
-            full_mask[valid_y1:valid_y2, valid_x1:valid_x2] = skin_mask_roi
-            
-            # Grab good tracking features that are strictly on the skin
-            self.prev_pts = cv2.goodFeaturesToTrack(frame_gray, maxCorners=50, qualityLevel=0.1, minDistance=5, mask=full_mask)
-            self.is_tracking = True
-        else:
-            self.is_tracking = False
-            
-        self.kf.predict() 
-
-    def predict_with_flow(self, current_gray, width, height):
-        """YOLO dropped a frame. Hallucinate the box using Optical Flow on previously verified skin pixels."""
-        if not self.is_tracking or self.prev_pts is None:
-            return None, None, None 
-            
-        next_pts, status, err = cv2.calcOpticalFlowPyrLK(self.prev_gray, current_gray, self.prev_pts, None)
-        
-        valid_dx, valid_dy = [], []
-        if next_pts is not None:
-            for i, (new, old) in enumerate(zip(next_pts, self.prev_pts)):
-                if status[i] == 1:
-                    valid_dx.append(new[0][0] - old[0][0])
-                    valid_dy.append(new[0][1] - old[0][1])
-                    
-        if len(valid_dx) > 5:
-            med_dx, med_dy = np.median(valid_dx), np.median(valid_dy)
-            self.kf.statePost[2] = np.float32(med_dx)
-            self.kf.statePost[3] = np.float32(med_dy)
-            self.prev_pts = next_pts[status == 1].reshape(-1, 1, 2)
-        else:
-            self.is_tracking = False
-            self.prev_pts = None
-            return None, None, None
-            
-        self.prev_gray = current_gray.copy()
-        prediction = self.kf.predict()
-        pred_x, pred_y = int(prediction[0][0]), int(prediction[1][0])
-        
-        margin = int(self.last_box_size * 0.0 - self.last_box_size*0.2 ) 
-        if (pred_x < -margin) or (pred_x > width + margin) or \
-           (pred_y < -margin) or (pred_y > height + margin):
-            self.is_tracking = False
-            self.prev_pts = None
-            return None, None, None
-            
-        return pred_x, pred_y, self.last_box_size
-    
-import math
-import numpy as np
-
-class OneEuroFilterVectorized:
-    def __init__(self, min_cutoff=1.0, beta=0.0, d_cutoff=1.0, freq=30):
-        self.min_cutoff = min_cutoff
-        self.beta = beta
-        self.d_cutoff = d_cutoff
-        self.freq = freq
-        
-        self.x_prev = None
-        self.dx_prev = None
-        self.t_prev = None
-
-    def __call__(self, x, t):
-        if self.x_prev is None:
-            self.x_prev = x
-            self.dx_prev = np.zeros_like(x)
-            self.t_prev = t
-            return x
-
-        te = t - self.t_prev
-        if te <= 0.0:
-            return x # Prevent division by zero on duplicate timestamps
-
-        ad = self.smoothing_factor(te, self.d_cutoff)
-        dx = (x - self.x_prev) / te
-        dx_hat = self.exponential_smoothing(ad, dx, self.dx_prev)
-
-        # Dynamic cutoff: speed up filter when moving fast
-        speed = np.linalg.norm(dx_hat, axis=-1, keepdims=True)
-        cutoff = self.min_cutoff + self.beta * speed
-        a = self.smoothing_factor(te, cutoff)
-        
-        x_hat = self.exponential_smoothing(a, x, self.x_prev)
-
-        self.x_prev = x_hat
-        self.dx_prev = dx_hat
-        self.t_prev = t
-
-        return x_hat
-
-    def smoothing_factor(self, te, cutoff):
-        r = 2 * math.pi * cutoff * te
-        return r / (r + 1)
-
-    def exponential_smoothing(self, a, x, x_prev):
-        return a * x + (1 - a) * x_prev
-
-
 app = modal.App("kosha-sota-hamer-pipeline")
 
 # ==========================================
@@ -259,13 +103,6 @@ def run_hamer_sota(image_crops_batch, is_right_hand_batch):
     print("[A100 GPU] SOTA processing complete.")
     return refined_3d_batch
 
-
-# ==========================================
-# 3. THE CPU ORCHESTRATOR (YOLO Amodal)
-# ========================
-# ==========================================
-# 3. THE CPU ORCHESTRATOR (YOLO -> MP Tasks -> HaMeR)
-# ==========================================
 # ==========================================
 # 3. THE CPU ORCHESTRATOR (YOLO -> MP Tasks -> HaMeR)
 # ==========================================
@@ -282,7 +119,7 @@ def process_video_pipeline(video_bytes: bytes, width: int, height: int, fps: flo
     import tempfile
     import urllib.request
     
-    # Modern MediaPipe Tasks API
+ 
     import mediapipe as mp
     from mediapipe.tasks import python
     from mediapipe.tasks.python import vision
@@ -318,18 +155,6 @@ def process_video_pipeline(video_bytes: bytes, width: int, height: int, fps: flo
         batch_handedness = []
         frame_metadata = []
         frame_id = 0
-        # Initialize filters (Tune beta if it lags, tune min_cutoff if it jitter
-        hand_filters = {
-            "target-left": {
-                "3d": OneEuroFilterVectorized(min_cutoff=0.9, beta=0.05, freq=fps),
-                "2d": OneEuroFilterVectorized(min_cutoff=0.9, beta=0.05, freq=fps)
-            },
-            "target-right": {
-                "3d": OneEuroFilterVectorized(min_cutoff=0.9, beta=0.05, freq=fps),
-                "2d": OneEuroFilterVectorized(min_cutoff=0.9, beta=0.05, freq=fps)
-            }
-        }
-        
         print("[CPU Node] Starting hybrid YOLO -> MediaPipe -> HaMeR extraction...")
         
         while cap.isOpened():
@@ -478,83 +303,6 @@ def process_video_pipeline(video_bytes: bytes, width: int, height: int, fps: flo
             
         cap.release()
         return [final_frames_dict[fid] for fid in sorted(final_frames_dict.keys())]
-
-
-
-'''def update_frames_dictionary(frames_dict, meta_list, refined_3d_list, width, height, hand_filters):
-    for meta, kps in zip(meta_list, refined_3d_list):
-        fid = meta["frame_id"]
-        t = meta["timestamp"]
-        label = meta["label"]  # "target-left" or "target-right"
-        
-        if fid not in frames_dict:
-            frames_dict[fid] = {
-                "frame_id": fid,
-                "timestamp": round(t, 3),
-                "camera_id": "ego_cam_front",
-                "image_size": [width, height],
-                "calibration_version": "v1.0",
-                "target-left": {"status": "unknown", "reason_flags": ["missing hand"], "keypoints": []},
-                "target-right": {"status": "unknown", "reason_flags": ["missing hand"], "keypoints": []}
-            }
-        
-        # 1. Convert raw lists to NumPy arrays for vectorized filtering
-        raw_3d = np.array(kps["3d"])
-        raw_2d = np.array(kps["2d"])
-        
-        # 2. Apply the 1 Euro Filter (Bypass if the array is empty or safety-net zeros)
-        if raw_3d.size > 0 and np.any(raw_3d):
-            smooth_3d = hand_filters[label]["3d"](raw_3d, t)
-            smooth_2d = hand_filters[label]["2d"](raw_2d, t)
-        else:
-            smooth_3d = raw_3d
-            smooth_2d = raw_2d
-            
-        # 3. Format back into JSON lists
-        # : Wrapped in float() to scrub NumPy data types and prevent json.dump crashes!
-        formatted_3d = [
-            {"id": i, "x": round(float(kp[0]), 4), "y": round(float(kp[1]), 4), "z": round(float(kp[2]), 4)} 
-            for i, kp in enumerate(smooth_3d)
-        ]
-        
-        formatted_2d = [
-            {"id": i, "x": round(float(kp[0]), 4), "y": round(float(kp[1]), 4)} 
-            for i, kp in enumerate(smooth_2d)
-        ]
-        
-        frames_dict[fid][label] = {
-            "status": "refined", 
-            "reason_flags": [], 
-            "bbox": meta["bbox"],
-            "keypoints_3d": formatted_3d,
-            "keypoints_2d": formatted_2d
-        }'''
-    
-def update_frames_dictionary(frames_dict, meta_list, refined_3d_list, width, height):
-    for meta, kps in zip(meta_list, refined_3d_list):
-        fid = meta["frame_id"]
-        
-        if fid not in frames_dict:
-            frames_dict[fid] = {
-                "frame_id": fid,
-                "timestamp": round(meta["timestamp"], 3),
-                "camera_id": "ego_cam_front",
-                "image_size": [width, height],
-                "calibration_version": "v1.0",
-                "target-left": {"status": "unknown", "reason_flags": ["missing hand"], "keypoints": []},
-                "target-right": {"status": "unknown", "reason_flags": ["missing hand"], "keypoints": []}
-            }
-        
-        formatted_3d = [{"id": i, "x": round(kp[0], 4), "y": round(kp[1], 4), "z": round(kp[2], 4)} for i, kp in enumerate(kps["3d"])]
-        formatted_2d = [{"id": i, "x": round(kp[0], 4), "y": round(kp[1], 4)} for i, kp in enumerate(kps["2d"])]
-        
-        frames_dict[fid][meta["label"]] = {
-            "status": "refined", 
-            "reason_flags": [], 
-            "bbox": meta["bbox"],
-            "keypoints_3d": formatted_3d,
-            "keypoints_2d": formatted_2d
-        }
 
 # ==========================================
 # 4. LOCAL ENTRYPOINT
